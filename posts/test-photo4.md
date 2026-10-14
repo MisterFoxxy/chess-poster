@@ -1,4 +1,4 @@
-when: 2020-01-01 10:00
+when: 2020-01-02 10:00
 to: vk
 status: sent
 card: announce
