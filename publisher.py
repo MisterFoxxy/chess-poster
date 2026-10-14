@@ -172,6 +172,24 @@ def _vk_photo_album(group_id, image, album_id):
     return f"photo{saved['owner_id']}_{saved['id']}"
 
 
+def _vk_photo_messages(group_id, image):
+    """Загрузка как фото для сообщений сообщества. Часто разрешена ключу группы;
+    потом пробуем прикрепить это фото к записи на стене."""
+    import requests
+
+    server = vk_call("photos.getMessagesUploadServer", peer_id=-group_id)
+    with open(image, "rb") as f:
+        uploaded = requests.post(server["upload_url"], files={"photo": f}, timeout=60).json()
+    saved = vk_call(
+        "photos.saveMessagesPhoto",
+        photo=uploaded["photo"],
+        server=uploaded["server"],
+        hash=uploaded["hash"],
+    )[0]
+    key = f"_{saved['access_key']}" if saved.get("access_key") else ""
+    return f"photo{saved['owner_id']}_{saved['id']}{key}"
+
+
 def _vk_doc_wall(group_id, image):
     """Загрузка картинки как документа для стены (часто разрешена ключу сообщества).
     Нужно право «документы» у ключа. В записи выглядит как прикреплённый файл с превью."""
@@ -188,22 +206,21 @@ def _vk_doc_wall(group_id, image):
 
 
 def vk_upload_photo(group_id, image):
-    """Пробует способы по очереди. Если ни один не подошёл, бросает ошибку со всеми причинами."""
+    """Пробует способы по очереди и возвращает строку-вложение (или бросает ошибку со всеми причинами).
+    Документ (выглядит как файл, а не как картинка) включается только если VK_ALLOW_DOC=1."""
     errors = []
-    try:
-        return _vk_photo_wall(group_id, image)
-    except Exception as exc:
-        errors.append(str(exc))
+    methods = [("стена", lambda: _vk_photo_wall(group_id, image))]
     album_id = os.getenv("VK_ALBUM_ID")
     if album_id:
+        methods.append(("альбом", lambda: _vk_photo_album(group_id, image, album_id)))
+    methods.append(("сообщения", lambda: _vk_photo_messages(group_id, image)))
+    if os.getenv("VK_ALLOW_DOC") == "1":
+        methods.append(("документ", lambda: _vk_doc_wall(group_id, image)))
+    for name, fn in methods:
         try:
-            return _vk_photo_album(group_id, image, album_id)
+            return fn()
         except Exception as exc:
-            errors.append(str(exc))
-    try:
-        return _vk_doc_wall(group_id, image)
-    except Exception as exc:
-        errors.append(str(exc))
+            errors.append(f"{name}: {exc}")
     raise RuntimeError(" | ".join(errors))
 
 
@@ -213,13 +230,19 @@ def send_vk(text, image, publish_ts=None):
     Если картинку прикрепить не удалось, запись выходит без неё (причина в журнале)."""
     group_id = int(os.environ["VK_GROUP_ID"])
     params = {"owner_id": -group_id, "from_group": 1, "message": text}
-    if image:
-        try:
-            params["attachments"] = vk_upload_photo(group_id, image)
-        except Exception as exc:
-            print(f"[VK] картинку прикрепить не удалось, публикуем без неё: {exc}", file=sys.stderr)
     if publish_ts:
         params["publish_date"] = int(publish_ts)
+    attachment = None
+    if image:
+        try:
+            attachment = vk_upload_photo(group_id, image)
+        except Exception as exc:
+            print(f"[VK] картинку прикрепить не удалось, публикуем без неё: {exc}", file=sys.stderr)
+    if attachment:
+        try:
+            return vk_call("wall.post", attachments=attachment, **params).get("post_id")
+        except Exception as exc:
+            print(f"[VK] запись с картинкой не принята ({exc}), публикуем без неё", file=sys.stderr)
     return vk_call("wall.post", **params).get("post_id")
 
 
