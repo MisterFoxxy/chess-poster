@@ -177,7 +177,7 @@ def _vk_photo_messages(group_id, image):
     потом пробуем прикрепить это фото к записи на стене."""
     import requests
 
-    server = vk_call("photos.getMessagesUploadServer", peer_id=-group_id)
+    server = vk_call("photos.getMessagesUploadServer")
     with open(image, "rb") as f:
         uploaded = requests.post(server["upload_url"], files={"photo": f}, timeout=60).json()
     saved = vk_call(
