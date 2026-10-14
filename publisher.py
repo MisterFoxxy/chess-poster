@@ -172,6 +172,21 @@ def _vk_photo_album(group_id, image, album_id):
     return f"photo{saved['owner_id']}_{saved['id']}"
 
 
+def _vk_doc_wall(group_id, image):
+    """Загрузка картинки как документа для стены (часто разрешена ключу сообщества).
+    Нужно право «документы» у ключа. В записи выглядит как прикреплённый файл с превью."""
+    import requests
+
+    server = vk_call("docs.getWallUploadServer", group_id=group_id)
+    with open(image, "rb") as f:
+        uploaded = requests.post(server["upload_url"], files={"file": f}, timeout=60).json()
+    if "file" not in uploaded:
+        raise RuntimeError(f"VK docs upload: {uploaded}")
+    saved = vk_call("docs.save", file=uploaded["file"], title=Path(image).stem)
+    doc = saved.get("doc", saved) if isinstance(saved, dict) else saved[0]
+    return f"doc{doc['owner_id']}_{doc['id']}"
+
+
 def vk_upload_photo(group_id, image):
     """Пробует способы по очереди. Если ни один не подошёл, бросает ошибку со всеми причинами."""
     errors = []
@@ -185,6 +200,10 @@ def vk_upload_photo(group_id, image):
             return _vk_photo_album(group_id, image, album_id)
         except Exception as exc:
             errors.append(str(exc))
+    try:
+        return _vk_doc_wall(group_id, image)
+    except Exception as exc:
+        errors.append(str(exc))
     raise RuntimeError(" | ".join(errors))
 
 
