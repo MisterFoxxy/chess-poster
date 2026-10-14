@@ -9,11 +9,21 @@
   * После отправки в файле обновляются поля sent_to и status.
 
 Запуск:
-  python publisher.py            # опубликовать то, что пора
-  python publisher.py --dry-run  # показать, что было бы отправлено, ничего не отправляя
+  python publisher.py            # сделать то, что пора
+  python publisher.py --dry-run  # показать, что было бы сделано, ничего не отправляя
   python publisher.py --list     # показать очередь
-  python publisher.py --schedule-vk            # отложить будущие посты в ВК (публикует сам ВК)
-  python publisher.py --schedule-vk --dry-run  # показать, что будет отложено
+
+Telegram: пост с картинкой уходит в канал, когда наступило время when.
+
+ВКонтакте: ключ сообщества не умеет прикреплять картинки к записям на стене,
+поэтому действует схема «текст в отложку, картинка в личку»:
+  * за VK_SCHEDULE_DAYS дней (по умолчанию 14) до времени when текст поста
+    ставится в ОТЛОЖЕННЫЕ записи группы без картинки, дальше ВК публикует его сам;
+  * картинка в этот момент приходит владельцу в личку Telegram (TELEGRAM_OWNER_ID)
+    со ссылкой на запись, её остаётся прикрепить к записи вручную в ВК;
+  * если время поста уже наступило, запись выходит сразу, картинку можно
+    добавить через «Редактировать».
+Старый способ (попытка прикрепить картинку) включается VK_IMAGE_MODE=attach.
 
 Картинка к посту: либо готовый файл (поле image:), либо автоматическая
 карточка из полей поста (поле card:, см. cards.py и README). Если указан
@@ -23,7 +33,7 @@
 import argparse
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -122,6 +132,25 @@ def send_telegram(text, image):
             return
     resp = requests.post(api + "sendMessage", data={"chat_id": chat_id, "text": text}, timeout=30)
     check(resp)
+
+
+def send_image_to_owner(image, caption):
+    """Присылает картинку владельцу в личные сообщения Telegram (бот пишет ему сам,
+    для этого владелец один раз должен нажать «Start» в чате с ботом)."""
+    import requests
+
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    owner = os.environ["TELEGRAM_OWNER_ID"]
+    with open(image, "rb") as f:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendPhoto",
+            data={"chat_id": owner, "caption": caption[:TG_CAPTION_LIMIT]},
+            files={"photo": f},
+            timeout=60,
+        )
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram (личка): {data.get('description')}")
 
 
 # ---------- ВКонтакте ----------
@@ -227,13 +256,14 @@ def vk_upload_photo(group_id, image):
 def send_vk(text, image, publish_ts=None):
     """Публикует запись на стене группы. С publish_ts (unixtime) запись становится
     отложенной: ВК сам опубликует её в это время, компьютер уже не нужен.
-    Если картинку прикрепить не удалось, запись выходит без неё (причина в журнале)."""
+    По умолчанию запись идёт БЕЗ картинки (картинку владелец получает в личку Telegram).
+    С VK_IMAGE_MODE=attach пробует прикрепить; не вышло, запись идёт без неё."""
     group_id = int(os.environ["VK_GROUP_ID"])
     params = {"owner_id": -group_id, "from_group": 1, "message": text}
     if publish_ts:
         params["publish_date"] = int(publish_ts)
     attachment = None
-    if image:
+    if image and os.getenv("VK_IMAGE_MODE", "dm").strip().lower() == "attach":
         try:
             attachment = vk_upload_photo(group_id, image)
         except Exception as exc:
@@ -286,44 +316,29 @@ def resolve_image(path, meta):
     return None, None
 
 
-def schedule_vk(dry_run):
-    """Ставит одобренные посты с будущей датой в ОТЛОЖЕННЫЕ записи ВК.
-    ВК публикует их сам, ноутбук может быть выключен. Помечает ВК выполненным,
-    чтобы обычный запуск не опубликовал запись второй раз."""
-    from datetime import timedelta
+def vk_ahead():
+    """За сколько дней до времени поста его текст ставится в отложенные записи ВК."""
+    try:
+        return timedelta(days=float(os.getenv("VK_SCHEDULE_DAYS", "14")))
+    except ValueError:
+        return timedelta(days=14)
 
-    now = datetime.now(tz())
-    count = 0
-    for path, meta, body in iter_posts():
-        if meta.get("status") != "approved" or "when" not in meta:
-            continue
-        if "vk" not in targets_of(meta) or "vk" in done_of(meta):
-            continue
-        when = parse_when(meta["when"])
-        if when <= now + timedelta(minutes=2):
-            continue  # время наступило или вот-вот наступит: опубликует обычный запуск
-        try:
-            image, image_path = resolve_image(path, meta)
-        except Exception as exc:
-            print(f"[{path.name}] {exc}", file=sys.stderr)
-            continue
-        if dry_run:
-            print(f"[dry-run] {path.name}: отложить в ВК на {meta['when']}, картинка: {image or 'нет'}")
-            continue
-        missing = [k for k in REQUIRED_ENV["vk"] if not os.getenv(k)]
-        if missing:
-            print(f"[{path.name}] нет настроек для vk: {', '.join(missing)}", file=sys.stderr)
-            continue
-        try:
-            post_id = send_vk(body, image_path, publish_ts=when.timestamp())
-        except Exception as exc:
-            print(f"[{path.name}] ошибка отложенной записи в ВК: {exc}", file=sys.stderr)
-            continue
-        save_meta(path, {"sent_to": ",".join(done_of(meta) + ["vk"]), "vk_scheduled": str(post_id)})
-        count += 1
-        print(f"[{path.name}] отложено в ВК на {meta['when']} (запись {post_id})")
-    if not count and not dry_run:
-        print("Нечего откладывать в ВК.")
+
+def owner_caption(body, when, scheduled, vk_post):
+    """Подпись к картинке, которую владелец получает в личку."""
+    first = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
+    if len(first) > 80:
+        first = first[:77] + "…"
+    lines = ["🖼 Картинка для поста в ВК", f"«{first}»", f"Время публикации: {when.strftime('%d.%m %H:%M')} (МСК)"]
+    if scheduled:
+        lines.append("Текст уже стоит в отложенных записях группы. Откройте запись, "
+                     "нажмите «Редактировать», прикрепите эту картинку и сохраните.")
+    else:
+        lines.append("Запись уже опубликована без картинки. Откройте её, нажмите "
+                     "«Редактировать» и прикрепите эту картинку.")
+    if vk_post:
+        lines.append(f"https://vk.com/wall-{os.environ['VK_GROUP_ID']}_{vk_post}")
+    return "\n".join(lines)
 
 
 def run(dry_run):
@@ -332,33 +347,44 @@ def run(dry_run):
     for path, meta, body in iter_posts():
         if meta.get("status") != "approved" or "when" not in meta:
             continue
-        if parse_when(meta["when"]) > now:
-            continue
-
-        image = meta.get("image")
-        image_path = str((path.parent / image).resolve()) if image else None
-        if image_path and not Path(image_path).exists():
-            print(f"[{path.name}] картинка не найдена: {image}", file=sys.stderr)
-            continue
-        if not image_path and meta.get("card"):
-            # картинка собирается автоматически из полей поста (см. cards.py)
-            try:
-                from cards import make_card
-                image_path = str(make_card(meta, path.parent / "img" / "auto" / (path.stem + ".png")))
-                image = "авто: " + Path(image_path).name
-            except Exception as exc:
-                print(f"[{path.name}] не удалось создать картинку: {exc}", file=sys.stderr)
-                continue
-
+        when = parse_when(meta["when"])
+        due = when <= now
+        targets = targets_of(meta)
         done = done_of(meta)
-        for target in targets_of(meta):
+
+        # что нужно сделать с этим постом в этот запуск
+        todo = []
+        for target in targets:
             if target in done:
                 continue
+            if due:
+                todo.append(target)
+            elif target == "vk" and now + timedelta(minutes=2) < when <= now + vk_ahead():
+                todo.append(target)  # заранее, в отложенные записи ВК
+        has_pic = bool(meta.get("image") or meta.get("card"))
+        dm_pending = "vk" in done and has_pic and meta.get("vk_image_dm") != "yes"
+        if not todo and not dm_pending:
+            if due and set(targets) <= set(done):
+                if not dry_run:
+                    save_meta(path, {"status": "sent", "sent_at": now.strftime("%Y-%m-%d %H:%M")})
+            continue
+
+        image, image_path = None, None
+        try:
+            image, image_path = resolve_image(path, meta)
+        except Exception as exc:
+            print(f"[{path.name}] картинка: {exc}", file=sys.stderr)
+            continue
+
+        vk_post = meta.get("vk_post")
+        for target in todo:
             if target not in SENDERS:
                 print(f"[{path.name}] неизвестный канал: {target}", file=sys.stderr)
                 continue
+            scheduled = target == "vk" and not due
             if dry_run:
-                print(f"[dry-run] {path.name} -> {target}: {len(body)} симв., картинка: {image or 'нет'}")
+                how = "в отложенные записи на " + meta["when"] if scheduled else "сразу"
+                print(f"[dry-run] {path.name} -> {target} ({how}): {len(body)} симв., картинка: {image or 'нет'}")
                 print("    " + body[:120].replace("\n", " ") + ("..." if len(body) > 120 else ""))
                 continue
             missing = [k for k in REQUIRED_ENV[target] if not os.getenv(k)]
@@ -366,16 +392,45 @@ def run(dry_run):
                 print(f"[{path.name}] нет настроек для {target}: {', '.join(missing)}", file=sys.stderr)
                 continue
             try:
-                SENDERS[target](body, image_path)
+                if target == "vk":
+                    vk_post = send_vk(body, image_path, publish_ts=when.timestamp() if scheduled else None)
+                else:
+                    SENDERS[target](body, image_path)
             except Exception as exc:  # одна ошибка не должна ронять остальные посты
                 print(f"[{path.name}] ошибка отправки в {target}: {exc}", file=sys.stderr)
                 continue
             done.append(target)
             sent_any = True
-            print(f"[{path.name}] отправлено в {target}")
-            save_meta(path, {"sent_to": ",".join(done)})
+            updates = {"sent_to": ",".join(done)}
+            if target == "vk":
+                updates["vk_post"] = str(vk_post)
+                print(f"[{path.name}] ВК: " + (f"поставлено в отложку на {meta['when']}" if scheduled
+                                               else "опубликовано сразу") + f" (запись {vk_post})")
+            else:
+                print(f"[{path.name}] отправлено в {target}")
+            save_meta(path, updates)
 
-        if not dry_run and set(targets_of(meta)) <= set(done):
+        # картинка для ВК уходит владельцу в личку Telegram
+        dm_failed = False
+        vk_handled = "vk" in done or (dry_run and "vk" in todo)
+        if vk_handled and image_path and meta.get("vk_image_dm") != "yes":
+            if os.getenv("VK_IMAGE_MODE", "dm").strip().lower() == "attach":
+                pass  # картинку пытались прикрепить сами, личка не нужна
+            elif dry_run:
+                print(f"[dry-run] {path.name}: картинка для ВК придёт владельцу в личку Telegram")
+            elif not os.getenv("TELEGRAM_OWNER_ID"):
+                print(f"[{path.name}] картинка для ВК не отправлена: не задан TELEGRAM_OWNER_ID", file=sys.stderr)
+            else:
+                try:
+                    send_image_to_owner(image_path, owner_caption(body, when, when > now, vk_post))
+                    save_meta(path, {"vk_image_dm": "yes"})
+                    sent_any = True
+                    print(f"[{path.name}] картинка для ВК отправлена в личку")
+                except Exception as exc:
+                    dm_failed = True
+                    print(f"[{path.name}] не удалось отправить картинку в личку: {exc}", file=sys.stderr)
+
+        if not dry_run and due and set(targets) <= set(done) and not dm_failed:
             save_meta(path, {"status": "sent", "sent_at": now.strftime("%Y-%m-%d %H:%M")})
 
     if not sent_any and not dry_run:
@@ -387,13 +442,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="ничего не отправлять, только показать")
     parser.add_argument("--list", action="store_true", help="показать очередь постов")
-    parser.add_argument("--schedule-vk", action="store_true",
-                        help="поставить одобренные будущие посты в отложенные записи ВК")
     args = parser.parse_args()
     if args.list:
         show_queue()
-    elif args.schedule_vk:
-        schedule_vk(args.dry_run)
     else:
         run(args.dry_run)
 
