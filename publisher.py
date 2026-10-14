@@ -15,15 +15,13 @@
 
 Telegram: пост с картинкой уходит в канал, когда наступило время when.
 
-ВКонтакте: ключ сообщества не умеет прикреплять картинки к записям на стене,
-поэтому действует схема «текст в отложку, картинка в личку»:
-  * за VK_SCHEDULE_DAYS дней (по умолчанию 14) до времени when текст поста
-    ставится в ОТЛОЖЕННЫЕ записи группы без картинки, дальше ВК публикует его сам;
-  * картинка в этот момент приходит владельцу в личку Telegram (TELEGRAM_OWNER_ID)
-    со ссылкой на запись, её остаётся прикрепить к записи вручную в ВК;
-  * если время поста уже наступило, запись выходит сразу, картинку можно
-    добавить через «Редактировать».
-Старый способ (попытка прикрепить картинку) включается VK_IMAGE_MODE=attach.
+ВКонтакте (по умолчанию, VK_MODE=manual): ключ сообщества не умеет прикреплять
+картинки к записям, поэтому в ВК пост публикует сам владелец:
+  * за VK_NOTIFY_DAYS дней (по умолчанию 3) до времени when бот присылает
+    владельцу в личку Telegram (TELEGRAM_OWNER_ID) картинку и отдельным сообщением
+    чистый текст поста;
+  * владелец публикует его в ВК или ставит в отложенные записи на нужное время.
+Режим VK_MODE=api публикует в ВК сам через ключ (VK_TOKEN, VK_GROUP_ID), но без картинки.
 
 Картинка к посту: либо готовый файл (поле image:), либо автоматическая
 карточка из полей поста (поле card:, см. cards.py и README). Если указан
@@ -134,23 +132,36 @@ def send_telegram(text, image):
     check(resp)
 
 
-def send_image_to_owner(image, caption):
-    """Присылает картинку владельцу в личные сообщения Telegram (бот пишет ему сам,
-    для этого владелец один раз должен нажать «Start» в чате с ботом)."""
+def send_vk_manual(text, image, when, due):
+    """Присылает владельцу в личку Telegram пост для ВК: картинку (с короткой пометкой)
+    и отдельным сообщением чистый текст, который удобно скопировать целиком.
+    Бот пишет в личку сам, для этого владелец один раз должен нажать «Start» у бота."""
     import requests
 
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     owner = os.environ["TELEGRAM_OWNER_ID"]
-    with open(image, "rb") as f:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{token}/sendPhoto",
-            data={"chat_id": owner, "caption": caption[:TG_CAPTION_LIMIT]},
-            files={"photo": f},
-            timeout=60,
-        )
-    data = resp.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram (личка): {data.get('description')}")
+    api = f"https://api.telegram.org/bot{token}/"
+
+    def check(resp):
+        data = resp.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram (личка): {data.get('description')}")
+
+    when_s = when.strftime("%d.%m в %H:%M")
+    if due:
+        head = f"📣 Пост для ВК. Время публикации уже наступило ({when_s} МСК), опубликуйте сейчас."
+    else:
+        head = (f"📣 Пост для ВК на {when_s} (МСК). Ниже картинка, а следующим сообщением текст. "
+                "Опубликуйте или поставьте в отложенные записи ВК на это время.")
+    if image:
+        with open(image, "rb") as f:
+            check(requests.post(api + "sendPhoto", data={"chat_id": owner, "caption": head},
+                                files={"photo": f}, timeout=60))
+    else:
+        check(requests.post(api + "sendMessage", data={"chat_id": owner, "text": head}, timeout=30))
+    for i in range(0, len(text), 4000):  # лимит сообщения Telegram 4096
+        check(requests.post(api + "sendMessage",
+                            data={"chat_id": owner, "text": text[i:i + 4000]}, timeout=30))
 
 
 # ---------- ВКонтакте ----------
@@ -256,14 +267,14 @@ def vk_upload_photo(group_id, image):
 def send_vk(text, image, publish_ts=None):
     """Публикует запись на стене группы. С publish_ts (unixtime) запись становится
     отложенной: ВК сам опубликует её в это время, компьютер уже не нужен.
-    По умолчанию запись идёт БЕЗ картинки (картинку владелец получает в личку Telegram).
-    С VK_IMAGE_MODE=attach пробует прикрепить; не вышло, запись идёт без неё."""
+    Работает только при VK_MODE=api. Ключ сообщества обычно не может прикрепить картинку,
+    тогда запись выходит без неё (причина в журнале)."""
     group_id = int(os.environ["VK_GROUP_ID"])
     params = {"owner_id": -group_id, "from_group": 1, "message": text}
     if publish_ts:
         params["publish_date"] = int(publish_ts)
     attachment = None
-    if image and os.getenv("VK_IMAGE_MODE", "dm").strip().lower() == "attach":
+    if image:
         try:
             attachment = vk_upload_photo(group_id, image)
         except Exception as exc:
@@ -316,29 +327,24 @@ def resolve_image(path, meta):
     return None, None
 
 
-def vk_ahead():
-    """За сколько дней до времени поста его текст ставится в отложенные записи ВК."""
+def vk_mode():
+    """manual (по умолчанию): пост для ВК присылается владельцу в личку, публикует он сам.
+    api: пост публикуется в ВК через ключ сообщества (картинку прикрепить обычно не удаётся)."""
+    return os.getenv("VK_MODE", "manual").strip().lower()
+
+
+def notify_window():
+    """За сколько дней до публикации пост для ВК присылается в личку (по умолчанию 3)."""
     try:
-        return timedelta(days=float(os.getenv("VK_SCHEDULE_DAYS", "14")))
+        return timedelta(days=float(os.getenv("VK_NOTIFY_DAYS", "3")))
     except ValueError:
-        return timedelta(days=14)
+        return timedelta(days=3)
 
 
-def owner_caption(body, when, scheduled, vk_post):
-    """Подпись к картинке, которую владелец получает в личку."""
-    first = next((ln.strip() for ln in body.splitlines() if ln.strip()), "")
-    if len(first) > 80:
-        first = first[:77] + "…"
-    lines = ["🖼 Картинка для поста в ВК", f"«{first}»", f"Время публикации: {when.strftime('%d.%m %H:%M')} (МСК)"]
-    if scheduled:
-        lines.append("Текст уже стоит в отложенных записях группы. Откройте запись, "
-                     "нажмите «Редактировать», прикрепите эту картинку и сохраните.")
-    else:
-        lines.append("Запись уже опубликована без картинки. Откройте её, нажмите "
-                     "«Редактировать» и прикрепите эту картинку.")
-    if vk_post:
-        lines.append(f"https://vk.com/wall-{os.environ['VK_GROUP_ID']}_{vk_post}")
-    return "\n".join(lines)
+def required_env(target):
+    if target == "vk" and vk_mode() != "api":
+        return ["TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID"]
+    return REQUIRED_ENV[target]
 
 
 def run(dry_run):
@@ -359,41 +365,36 @@ def run(dry_run):
                 continue
             if due:
                 todo.append(target)
-            elif target == "vk" and now + timedelta(minutes=2) < when <= now + vk_ahead():
-                todo.append(target)  # заранее, в отложенные записи ВК
-        has_pic = bool(meta.get("image") or meta.get("card"))
-        dm_pending = "vk" in done and has_pic and meta.get("vk_image_dm") != "yes"
-        if not todo and not dm_pending:
-            if due and set(targets) <= set(done):
-                if not dry_run:
-                    save_meta(path, {"status": "sent", "sent_at": now.strftime("%Y-%m-%d %H:%M")})
+            elif target == "vk" and vk_mode() != "api" and when <= now + notify_window():
+                todo.append(target)  # заранее: пост для ВК уходит владельцу в личку
+        if not todo:
+            if due and set(targets) <= set(done) and not dry_run:
+                save_meta(path, {"status": "sent", "sent_at": now.strftime("%Y-%m-%d %H:%M")})
             continue
 
-        image, image_path = None, None
         try:
             image, image_path = resolve_image(path, meta)
         except Exception as exc:
             print(f"[{path.name}] картинка: {exc}", file=sys.stderr)
             continue
 
-        vk_post = meta.get("vk_post")
         for target in todo:
             if target not in SENDERS:
                 print(f"[{path.name}] неизвестный канал: {target}", file=sys.stderr)
                 continue
-            scheduled = target == "vk" and not due
+            manual = target == "vk" and vk_mode() != "api"
             if dry_run:
-                how = "в отложенные записи на " + meta["when"] if scheduled else "сразу"
+                how = "в личку владельцу (публикуете сами)" if manual else "публикация"
                 print(f"[dry-run] {path.name} -> {target} ({how}): {len(body)} симв., картинка: {image or 'нет'}")
                 print("    " + body[:120].replace("\n", " ") + ("..." if len(body) > 120 else ""))
                 continue
-            missing = [k for k in REQUIRED_ENV[target] if not os.getenv(k)]
+            missing = [k for k in required_env(target) if not os.getenv(k)]
             if missing:
                 print(f"[{path.name}] нет настроек для {target}: {', '.join(missing)}", file=sys.stderr)
                 continue
             try:
-                if target == "vk":
-                    vk_post = send_vk(body, image_path, publish_ts=when.timestamp() if scheduled else None)
+                if manual:
+                    send_vk_manual(body, image_path, when, due)
                 else:
                     SENDERS[target](body, image_path)
             except Exception as exc:  # одна ошибка не должна ронять остальные посты
@@ -401,36 +402,11 @@ def run(dry_run):
                 continue
             done.append(target)
             sent_any = True
-            updates = {"sent_to": ",".join(done)}
-            if target == "vk":
-                updates["vk_post"] = str(vk_post)
-                print(f"[{path.name}] ВК: " + (f"поставлено в отложку на {meta['when']}" if scheduled
-                                               else "опубликовано сразу") + f" (запись {vk_post})")
-            else:
-                print(f"[{path.name}] отправлено в {target}")
-            save_meta(path, updates)
+            print(f"[{path.name}] " + ("ВК: пост отправлен вам в личку Telegram" if manual
+                                      else f"отправлено в {target}"))
+            save_meta(path, {"sent_to": ",".join(done)})
 
-        # картинка для ВК уходит владельцу в личку Telegram
-        dm_failed = False
-        vk_handled = "vk" in done or (dry_run and "vk" in todo)
-        if vk_handled and image_path and meta.get("vk_image_dm") != "yes":
-            if os.getenv("VK_IMAGE_MODE", "dm").strip().lower() == "attach":
-                pass  # картинку пытались прикрепить сами, личка не нужна
-            elif dry_run:
-                print(f"[dry-run] {path.name}: картинка для ВК придёт владельцу в личку Telegram")
-            elif not os.getenv("TELEGRAM_OWNER_ID"):
-                print(f"[{path.name}] картинка для ВК не отправлена: не задан TELEGRAM_OWNER_ID", file=sys.stderr)
-            else:
-                try:
-                    send_image_to_owner(image_path, owner_caption(body, when, when > now, vk_post))
-                    save_meta(path, {"vk_image_dm": "yes"})
-                    sent_any = True
-                    print(f"[{path.name}] картинка для ВК отправлена в личку")
-                except Exception as exc:
-                    dm_failed = True
-                    print(f"[{path.name}] не удалось отправить картинку в личку: {exc}", file=sys.stderr)
-
-        if not dry_run and due and set(targets) <= set(done) and not dm_failed:
+        if not dry_run and due and set(targets) <= set(done):
             save_meta(path, {"status": "sent", "sent_at": now.strftime("%Y-%m-%d %H:%M")})
 
     if not sent_any and not dry_run:
