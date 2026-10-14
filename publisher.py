@@ -137,7 +137,8 @@ def vk_call(method, **params):
     return data["response"]
 
 
-def vk_upload_photo(group_id, image):
+def _vk_photo_wall(group_id, image):
+    """Загрузка на стену. В ВК работает только с ключом пользователя, не сообщества."""
     import requests
 
     server = vk_call("photos.getWallUploadServer", group_id=group_id)
@@ -153,13 +154,51 @@ def vk_upload_photo(group_id, image):
     return f"photo{saved['owner_id']}_{saved['id']}"
 
 
+def _vk_photo_album(group_id, image, album_id):
+    """Загрузка в альбом группы (может работать с ключом сообщества). Нужен VK_ALBUM_ID."""
+    import requests
+
+    server = vk_call("photos.getUploadServer", album_id=int(album_id), group_id=group_id)
+    with open(image, "rb") as f:
+        uploaded = requests.post(server["upload_url"], files={"file1": f}, timeout=60).json()
+    saved = vk_call(
+        "photos.save",
+        album_id=int(album_id),
+        group_id=group_id,
+        server=uploaded["server"],
+        photos_list=uploaded["photos_list"],
+        hash=uploaded["hash"],
+    )[0]
+    return f"photo{saved['owner_id']}_{saved['id']}"
+
+
+def vk_upload_photo(group_id, image):
+    """Пробует способы по очереди. Если ни один не подошёл, бросает ошибку со всеми причинами."""
+    errors = []
+    try:
+        return _vk_photo_wall(group_id, image)
+    except Exception as exc:
+        errors.append(str(exc))
+    album_id = os.getenv("VK_ALBUM_ID")
+    if album_id:
+        try:
+            return _vk_photo_album(group_id, image, album_id)
+        except Exception as exc:
+            errors.append(str(exc))
+    raise RuntimeError(" | ".join(errors))
+
+
 def send_vk(text, image, publish_ts=None):
     """Публикует запись на стене группы. С publish_ts (unixtime) запись становится
-    отложенной: ВК сам опубликует её в это время, компьютер уже не нужен."""
+    отложенной: ВК сам опубликует её в это время, компьютер уже не нужен.
+    Если картинку прикрепить не удалось, запись выходит без неё (причина в журнале)."""
     group_id = int(os.environ["VK_GROUP_ID"])
     params = {"owner_id": -group_id, "from_group": 1, "message": text}
     if image:
-        params["attachments"] = vk_upload_photo(group_id, image)
+        try:
+            params["attachments"] = vk_upload_photo(group_id, image)
+        except Exception as exc:
+            print(f"[VK] картинку прикрепить не удалось, публикуем без неё: {exc}", file=sys.stderr)
     if publish_ts:
         params["publish_date"] = int(publish_ts)
     return vk_call("wall.post", **params).get("post_id")
