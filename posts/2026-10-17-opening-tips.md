@@ -1,8 +1,9 @@
 when: 2026-10-17 12:00
 to: telegram, vk
-status: approved
+status: sent
 image: img/tips.png
-sent_to: vk
+sent_to: vk,telegram
+sent_at: 2026-10-17 15:25
 
 ♟ 3 правила дебюта, которые сразу добавят очков
 
