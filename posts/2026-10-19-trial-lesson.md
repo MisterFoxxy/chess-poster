@@ -1,13 +1,14 @@
 when: 2026-10-19 18:00
 to: telegram, vk
-status: approved
+status: sent
 card: announce
 title: Бесплатное пробное занятие
 subtitle: 20 минут онлайн
 lines: Познакомимся с ребёнком | Оценим уровень подготовки | Подберём подходящего тренера
 button: Запись открыта
 vk_manual: yes
-sent_to: vk
+sent_to: vk,telegram
+sent_at: 2026-10-19 22:38
 
 🎁 Бесплатное пробное занятие в онлайн-школе «Тимур и его команда»!
 
