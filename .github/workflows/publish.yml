@@ -2,15 +2,15 @@ name: Publish posts
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+    - cron: "*/5 * * * *"   # резервный запуск (GitHub может запускать с задержкой)
+  workflow_dispatch:         # запуск кнопкой «Run workflow» и по сигналу от cron-job.org
 
 permissions:
-  contents: write
+  contents: write            # нужно, чтобы сохранять новые посты и статусы (sent) в репозитории
 
 concurrency:
   group: publish
-  cancel-in-progress: false
+  cancel-in-progress: false  # запуски идут по очереди, чтобы не было дублей
 
 jobs:
   publish:
@@ -24,9 +24,18 @@ jobs:
           python-version: "3.12"
 
       - name: Установка зависимостей
-        run: |
-          sudo apt-get install -y --no-install-recommends fonts-dejavu-core
-          pip install requests pillow tzdata
+        run: pip install requests pillow tzdata
+
+      - name: Автопланирование новых постов
+        continue-on-error: true   # ошибка здесь не должна мешать публикации
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_OWNER_ID: ${{ secrets.TELEGRAM_OWNER_ID }}
+          POST_TZ: Europe/Moscow
+          AUTOPLAN: ${{ vars.AUTOPLAN }}
+          AUTO_STATUS: ${{ vars.AUTO_STATUS }}
+          AUTOPLAN_DAYS: ${{ vars.AUTOPLAN_DAYS }}
+        run: python autoplan.py
 
       - name: Публикация одобренных постов
         env:
@@ -35,16 +44,17 @@ jobs:
           TELEGRAM_OWNER_ID: ${{ secrets.TELEGRAM_OWNER_ID }}
           VK_TOKEN: ${{ secrets.VK_TOKEN }}
           VK_GROUP_ID: ${{ secrets.VK_GROUP_ID }}
+          VK_AHEAD_DAYS: ${{ vars.VK_AHEAD_DAYS }}
           POST_TZ: Europe/Moscow
         run: python publisher.py
 
-      - name: Сохранить статусы постов
+      - name: Сохранить новые посты и статусы
         if: always()
         run: |
           git config user.name "chess-poster-bot"
           git config user.email "chess-poster-bot@users.noreply.github.com"
           git add -A posts
           if ! git diff --cached --quiet; then
-            git commit -m "Обновлены статусы постов"
+            git commit -m "Автопосты и статусы"
             git pull --rebase && git push || (sleep 5 && git pull --rebase && git push)
           fi
