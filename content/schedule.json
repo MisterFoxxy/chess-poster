@@ -1,0 +1,38 @@
+{
+ "timezone": "Europe/Moscow",
+ "horizon_days": 14,
+ "url": "https://chess-children-liga.ru/chessacademy",
+ "answer": {
+  "days_after": 1,
+  "time": "12:00"
+ },
+ "slots": [
+  {
+   "day": "mon",
+   "time": "19:00",
+   "kind": "puzzle"
+  },
+  {
+   "day": "thu",
+   "time": "19:00",
+   "kind": [
+    "tips",
+    "fact"
+   ]
+  },
+  {
+   "day": "sat",
+   "time": "12:00",
+   "kind": [
+    "term",
+    "quiz",
+    "fact"
+   ]
+  },
+  {
+   "day": "sun",
+   "time": "18:00",
+   "kind": "promo"
+  }
+ ]
+}

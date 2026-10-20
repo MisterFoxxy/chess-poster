@@ -17,11 +17,13 @@ Telegram: пост с картинкой уходит в канал, когда 
 
 ВКонтакте: ключ сообщества не умеет прикреплять картинки к записям на стене.
 Поэтому по умолчанию (VK_MODE=schedule) действует схема «текст в отложку, картинка в личку»:
-  * за VK_AHEAD_DAYS дней (по умолчанию 14) до времени when текст поста ставится в
+  * за VK_AHEAD_DAYS дней (по умолчанию 3) до времени when текст поста ставится в
     ОТЛОЖЕННЫЕ записи группы без картинки, дальше ВК публикует его сам;
   * картинка в этот момент приходит владельцу в личку Telegram (TELEGRAM_OWNER_ID)
     со ссылкой на запись, её остаётся прикрепить вручную («Редактировать»);
-  * если ВК запись не принял, бот присылает владельцу в личку полный пост
+  * если на это время в ВК уже стоит такая же запись (например, после повторного запуска),
+    бот её не дублирует и присылает только картинку;
+  * если ВК запись не принял по другой причине, бот присылает владельцу в личку полный пост
     (картинку и текст) с причиной, и владелец публикует его сам;
   * если время поста уже наступило, запись выходит в ВК сразу.
 Режим VK_MODE=manual: бот ничего не пишет в ВК, а за VK_AHEAD_DAYS (по умолчанию 3)
@@ -209,6 +211,21 @@ def send_vk(text, publish_ts=None):
     return vk_call("wall.post", **params).get("post_id")
 
 
+def _norm(text):
+    return " ".join((text or "").split())[:60]
+
+
+def find_vk_postponed(text, publish_ts):
+    """Ищет среди отложенных записей группы запись с таким же началом текста на это же время.
+    Возвращает id записи или None; при ошибке ВК бросает исключение."""
+    group_id = int(os.environ["VK_GROUP_ID"])
+    resp = vk_call("wall.get", owner_id=-group_id, filter="postponed", count=100)
+    for item in resp.get("items", []):
+        if abs(int(item.get("date", 0)) - int(publish_ts)) <= 120 and _norm(item.get("text")) == _norm(text):
+            return item.get("id")
+    return None
+
+
 SENDERS = {"telegram": send_telegram, "vk": send_vk}
 REQUIRED_ENV = {
     "telegram": ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"],
@@ -256,7 +273,7 @@ def vk_mode():
 
 def ahead_window():
     """За сколько дней до публикации бот занимается постом для ВК."""
-    default = "3" if vk_mode() == "manual" else "14"
+    default = "3"
     try:
         return timedelta(days=float(os.getenv("VK_AHEAD_DAYS") or default))
     except ValueError:
@@ -295,7 +312,8 @@ def run(dry_run):
                 if now + lead < when <= now + ahead_window():
                     todo.append(target)
         has_pic = bool(meta.get("image") or meta.get("card"))
-        dm_pending = ("vk" in done and bool(vk_post) and has_pic and owner_ok
+        vk_text = bool(vk_post)  # текст поста стоит в ВК
+        dm_pending = ("vk" in done and vk_text and has_pic and owner_ok
                       and meta.get("vk_image_dm") != "yes")
         if not todo and not dm_pending:
             if due and set(targets) <= set(done) and not dry_run:
@@ -340,17 +358,35 @@ def run(dry_run):
                     try:
                         vk_post = send_vk(body, publish_ts=when.timestamp() if scheduled else None)
                         updates["vk_post"] = str(vk_post)
+                        vk_text = True
                         note = (f"ВК: поставлено в отложку на {meta['when']}" if scheduled
                                 else "ВК: опубликовано сразу") + f" (запись {vk_post})"
                     except Exception as vk_exc:
-                        if not owner_ok:
-                            raise
-                        # ВК запись не принял: отдаём владельцу полный пост, чтобы он ничего не потерял
-                        print(f"[{path.name}] ВК не принял запись: {vk_exc}", file=sys.stderr)
-                        send_vk_manual(body, image_path, when, due, reason=str(vk_exc))
-                        updates["vk_manual"] = "yes"
-                        vk_post = None
-                        note = "ВК: запись не принята, полный пост отправлен вам в личку Telegram"
+                        if scheduled and "already scheduled" in str(vk_exc).lower():
+                            # на это время в ВК уже стоит запись: проверяем, что это наш текст
+                            try:
+                                found = find_vk_postponed(body, when.timestamp())
+                            except Exception as look_exc:
+                                print(f"[{path.name}] не удалось проверить отложку ВК: {look_exc}", file=sys.stderr)
+                                found = None
+                                vk_exc = RuntimeError("на это время в ВК уже стоит запись, а проверить её текст не удалось: "
+                                                      + str(vk_exc))
+                            if found:
+                                vk_post = found
+                                updates["vk_post"] = str(found)
+                                vk_text = True
+                                note = f"ВК: такая запись уже стоит в отложке (запись {found}), текст не дублирую"
+                            elif "проверить её текст" not in str(vk_exc):
+                                vk_exc = RuntimeError("на это время в ВК уже стоит другая запись: " + str(vk_exc))
+                        if not vk_text:
+                            if not owner_ok:
+                                raise vk_exc
+                            # ВК запись не принял: отдаём владельцу полный пост, чтобы он ничего не потерял
+                            print(f"[{path.name}] ВК не принял запись: {vk_exc}", file=sys.stderr)
+                            send_vk_manual(body, image_path, when, due, reason=str(vk_exc))
+                            updates["vk_manual"] = "yes"
+                            vk_post = None
+                            note = "ВК: запись не принята, полный пост отправлен вам в личку Telegram"
             except Exception as exc:  # одна ошибка не должна ронять остальные посты
                 print(f"[{path.name}] ошибка отправки в {target}: {exc}", file=sys.stderr)
                 continue
@@ -362,7 +398,7 @@ def run(dry_run):
 
         # картинка для записи, которую бот поставил в ВК, уходит владельцу в личку Telegram
         dm_failed = False
-        if "vk" in done and vk_post and image_path and meta.get("vk_image_dm") != "yes":
+        if "vk" in done and vk_text and image_path and meta.get("vk_image_dm") != "yes":
             if dry_run:
                 print(f"[dry-run] {path.name}: картинка придёт вам в личку Telegram")
             elif not owner_ok:
@@ -396,7 +432,10 @@ def owner_caption(body, when, scheduled, vk_post):
     else:
         lines.append("Запись уже опубликована без картинки. Откройте её, нажмите "
                      "«Редактировать» и прикрепите эту картинку.")
-    lines.append(f"https://vk.com/wall-{os.environ['VK_GROUP_ID']}_{vk_post}")
+    if vk_post:
+        lines.append(f"https://vk.com/wall-{os.environ['VK_GROUP_ID']}_{vk_post}")
+    else:
+        lines.append("Запись ищите в отложенных записях группы на это время.")
     return "\n".join(lines)
 
 
