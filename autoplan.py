@@ -8,9 +8,19 @@
   * Пн 19:00 — «Задача дня» (мат в 1-2 хода) из банка content/puzzles.json;
   * на следующий день в 12:00 — «Ответ на задачу» к ней (для любой задачи из банка,
     в том числе написанной вручную: ищется по расположению фигур);
-  * Чт 19:00 — советы тренера или шахматный факт (по очереди);
+  * Чт 19:00 — советы тренера или советы родителям (по очереди);
   * Сб 12:00 — термин, вопрос-голосование или факт (по очереди);
-  * Вс 18:00 — пост о школе (набор, пробное занятие, польза шахмат).
+  * Вс 18:00 — пост о школе (набор, пробное занятие, польза шахмат). Если на это время
+    есть ваш живой пост (итоги турнира, фото с занятий), бот слот пропускает.
+
+Ссылка на запись ставится только в посты о школе и в рубрики из списка cta_kinds
+в content/schedule.json (по умолчанию список пустой — без рекламы в каждом посте).
+
+Под задачей и вопросом дня в Telegram бот добавляет опрос (поля poll*, см. publisher.py):
+к задаче — викторину «какая фигура делает первый ход», к вопросу дня — голосование А/Б.
+
+Заготовка советов, фактов, терминов и вопросов не берётся, если такая тема уже была
+в постах за последние 60 дней (в том числе в написанных вручную).
 
 Каждый пост — обычный файл в posts/ с полями  source: auto  и  slot: ...  Дальше его подхватывает
 publisher.py: в Telegram он уходит в назначенное время, в ВК текст ставится в отложку заранее.
@@ -96,11 +106,18 @@ class Texts:
     def __init__(self, cfg, cta):
         self.url = cfg["url"]
         self.cta = cta
+        # в каких рубриках в конце поста ставится ссылка на запись (посты о школе — всегда со своей ссылкой)
+        self.cta_kinds = set(cfg.get("cta_kinds", []))
 
-    def next_cta(self, state):
-        n = state["cta"] % len(self.cta)
-        state["cta"] += 1
-        return self.cta[n]
+    def finish(self, out, kind, state):
+        """Добавляет в конец ссылку на запись (только для рубрик из cta_kinds) и собирает текст."""
+        if kind in self.cta_kinds and self.cta:
+            n = state["cta"] % len(self.cta)
+            state["cta"] += 1
+            out += ["", self.cta[n]]
+        while out and not out[-1].strip():
+            out.pop()
+        return "\n".join(out)
 
     def puzzle(self, pz, state):
         side = "Белые" if pz["side"] == "w" else "Чёрные"
@@ -110,9 +127,8 @@ class Texts:
             out += [pz["intro"]]
         elif pz.get("caption"):
             out += [f"Позиция получилась после ходов: {pz['caption']}."]
-        out += ["", "Найдите решение и напишите ответ в комментариях. Правильный ответ покажем завтра в 12:00.",
-                "", self.next_cta(state)]
-        return "\n".join(out)
+        out += ["", "Найдите решение и напишите ответ в комментариях. Правильный ответ покажем завтра в 12:00."]
+        return self.finish(out, "puzzle", state)
 
     def answer(self, pz, state):
         out = ["✅ Ответ на вчерашнюю задачу", ""]
@@ -123,37 +139,90 @@ class Texts:
             out += [f"Правильный ход: {pz['san']}", "", expl]
         if pz.get("name") and pz["name"].lower() not in expl.lower():
             out += ["", f"📚 Знаменитая позиция: «{pz['name']}»."]
-        out += ["", "Получилось найти решение? Расскажите в комментариях!", "", self.next_cta(state)]
-        return "\n".join(out)
+        out += ["", "Получилось найти решение? Расскажите в комментариях!"]
+        return self.finish(out, "answer", state)
 
-    def tips(self, tip, state):
-        out = [f"♟ {tip['title']}", ""]
-        for i, line in enumerate(tip["lines"], 1):
+    def _numbered(self, lines):
+        out = []
+        for i, line in enumerate(lines, 1):
             main, _, detail = line.partition("::")
             out.append(f"{i}. {sentence(main)}" + (f" {sentence(detail)}" if detail else ""))
+        return out
+
+    def tips(self, tip, state):
+        out = [f"♟ {tip['title']}", ""] + self._numbered(tip["lines"])
         if tip.get("note"):
             out += ["", sentence(tip["note"])]
-        out += ["", self.next_cta(state)]
-        return "\n".join(out)
+        out += ["", "А какой совет пригодился бы вам? Напишите в комментариях 👇"]
+        return self.finish(out, "tips", state)
+
+    def parents(self, tip, state):
+        out = [f"👨‍👩‍👧 Родителям: {tip['title']}", ""] + self._numbered(tip["lines"])
+        if tip.get("note"):
+            out += ["", sentence(tip["note"])]
+        out += ["", "А как это устроено у вас дома? Поделитесь в комментариях 👇"]
+        return self.finish(out, "parents", state)
 
     def fact(self, fact, state):
         out = ["💡 Шахматный факт", "", sentence(fact["title"])]
         if fact.get("note"):
             out.append(sentence(fact["note"]))
-        out += ["", self.next_cta(state)]
-        return "\n".join(out)
+        out += ["", "Знали об этом раньше?"]
+        return self.finish(out, "fact", state)
 
     def term(self, term, state):
         out = [f"📖 Шахматный термин: {term['title']}", "", sentence(term["definition"]), "",
-               f"Пример: {sentence(term['example'])}", "", self.next_cta(state)]
-        return "\n".join(out)
+               f"Пример: {sentence(term['example'])}"]
+        return self.finish(out, "term", state)
 
     def quiz(self, q, state):
-        return "\n".join([f"❓ Вопрос дня: {q['title']}", "", f"А — {q['a']}", f"Б — {q['b']}", "",
-                          "Голосуйте в комментариях: напишите А или Б. Можно объяснить свой выбор!"])
+        out = [f"❓ Вопрос дня: {q['title']}", "", f"А — {q['a']}", f"Б — {q['b']}", "",
+               "Ваш выбор — А или Б? Объясните в комментариях, почему!"]
+        return self.finish(out, "quiz", state)
 
     def promo(self, promo, state):
         return promo["text"].replace("{url}", self.url)
+
+
+# ---------- опросы в Telegram ----------
+
+PIECE_NAMES = {"k": "Король", "q": "Ферзь", "r": "Ладья", "b": "Слон", "n": "Конь", "p": "Пешка"}
+SAN_PIECE = {"Кр": "k", "Ф": "q", "Л": "r", "С": "b", "К": "n"}
+
+
+def first_piece(san):
+    """Какая фигура делает ход (по русской записи хода: Кр, Ф, Л, С, К, пешка — с буквы поля)."""
+    s = (san or "").strip()
+    if s.upper().startswith(("O-O", "0-0")):
+        return "k"
+    for prefix, code in SAN_PIECE.items():  # «Кр» проверяется раньше «К»
+        if s.startswith(prefix):
+            return code
+    return "p" if s[:1] in "abcdefgh" else None
+
+
+def poll_fields(kind, item):
+    """Поля шапки поста для опроса под постом в Telegram (в ВК опроса нет)."""
+    if kind == "quiz":
+        return {"poll": item["title"], "poll_options": f"А — {item['a']} | Б — {item['b']}",
+                "poll_hint": "👇 Голосуйте в опросе под постом!"}
+    if kind != "puzzle":
+        return {}
+    right = first_piece(item.get("san"))
+    board = (item.get("fen") or "").split()[0]
+    mine = {c.lower() for c in board if c.isalpha() and (c.isupper() if item["side"] == "w" else c.islower())}
+    if right is None or right not in mine:
+        return {}
+    order = [p for p in "kqrbnp" if p in mine]
+    others = [p for p in order if p != right]
+    options = [p for p in order if p == right or p in others[:3]]
+    if len(options) < 2:
+        return {}
+    return {"poll": "Какая фигура делает первый ход решения?",
+            "poll_options": " | ".join(PIECE_NAMES[p] for p in options),
+            "poll_correct": str(options.index(right)),
+            "poll_note": "Полное решение покажем завтра в 12:00",
+            "poll_hint": "👇 Под постом — викторина-подсказка: угадайте, какая фигура ходит первой!"}
 
 
 def card_fields(kind, item, side_flip=None):
@@ -169,13 +238,17 @@ def card_fields(kind, item, side_flip=None):
         h = {"card": "tips", "title": item["title"], "lines": " | ".join(item["lines"]),
              "note": item.get("note", ""), "theme": item.get("theme", "")}
         return h
+    if kind == "parents":
+        return {"card": "tips", "tag": "РОДИТЕЛЯМ", "title": item["title"], "lines": " | ".join(item["lines"]),
+                "note": item.get("note", ""), "theme": item.get("theme", "")}
     if kind == "fact":
         return {"card": "fact", "title": item["title"], "note": item.get("note", ""), "piece": item.get("piece", "")}
     if kind == "term":
         return {"card": "term", "title": item["title"], "subtitle": item.get("subtitle", ""),
                 "definition": item["definition"], "example": item["example"]}
     if kind == "quiz":
-        return {"card": "quiz", "title": item["title"], "a": item["a"], "b": item["b"]}
+        return {"card": "quiz", "title": item["title"], "a": item["a"], "b": item["b"],
+                "note": "Ваш выбор — А или Б?"}
     if kind == "promo":
         h = {"card": item["card"], "title": item["title"], "theme": item.get("theme", "")}
         for key in ("subtitle", "button", "url", "note", "kicker", "headline", "stub", "steps"):
@@ -190,25 +263,41 @@ def card_fields(kind, item, side_flip=None):
 # ---------- банки контента ----------
 
 BANK_FILES = {"puzzle": "puzzles.json", "tips": "tips.json", "fact": "facts.json", "term": "terms.json",
-              "quiz": "quiz.json", "promo": "promos.json"}
+              "quiz": "quiz.json", "promo": "promos.json", "parents": "parents.json"}
+
+# рубрики, в которых заготовка не берётся, если её тема уже встречалась в недавних постах (в том числе ручных)
+DEDUP_KINDS = {"tips", "parents", "fact", "term", "quiz"}
+DEDUP_DAYS = 60
 
 
-def pick_item(kind, banks, state, taken_fens, notes):
-    """Следующий ещё не использованный элемент банка (когда банк кончился, идём по кругу)."""
+def norm_text(text):
+    return " ".join("".join(ch.lower() if ch.isalnum() else " " for ch in str(text)).split())
+
+
+def pick_item(kind, banks, state, taken_fens, notes, recent_texts=()):
+    """Следующий ещё не использованный элемент банка (когда банк кончился, идём по кругу).
+    Заготовку, чья тема уже была в недавних постах (recent_texts), пропускаем."""
     bank = banks[kind]
     used = state["used"].setdefault(kind, [])
+
+    def repeated(it):
+        if kind not in DEDUP_KINDS:
+            return False
+        title = norm_text(it.get("title", ""))
+        return bool(title) and any(title in t for t in recent_texts)
 
     def free(it):
         if it["id"] in used:
             return False
         return not (kind == "puzzle" and placement(it["fen"]) in taken_fens)
 
-    avail = [it for it in bank if free(it)]
+    avail = [it for it in bank if free(it) and not repeated(it)] or [it for it in bank if free(it)]
     if not avail:
         notes.append(f"банк «{kind}» закончился, начинаю по кругу")
         state["used"][kind] = []
         used = state["used"][kind]
         avail = [it for it in bank if not (kind == "puzzle" and placement(it["fen"]) in taken_fens)] or bank
+        avail = [it for it in avail if not repeated(it)] or avail
     item = avail[0]
     used.append(item["id"])
     return item
@@ -266,7 +355,9 @@ def plan(now, posts_dir, state_path, dry_run=False, status="approved", horizon_d
             n += 1
         header = {"when": fmt_dt(when), "to": "telegram, vk", "status": status, "source": "auto"}
         header.update(header_extra)
-        header.update(card_fields(kind, item) if kind != "answer" else {})
+        if kind != "answer":
+            header.update(card_fields(kind, item))
+            header.update(poll_fields(kind, item))
         path = posts_dir / name
         if not dry_run:
             write_post(path, header, body)
@@ -291,7 +382,11 @@ def plan(now, posts_dir, state_path, dry_run=False, status="approved", horizon_d
             kinds = slot["kind"] if isinstance(slot["kind"], list) else [slot["kind"]]
             start = state["rot"].get(slot["day"], 0)
             kind = kinds[start % len(kinds)]
-            item = pick_item(kind, banks, state, taken, notes)
+            since = now - timedelta(days=DEDUP_DAYS)
+            recent = [norm_text(p["meta"].get("title", "") + " " + p["body"]) for p in posts
+                      if p["when"] is not None and p["when"] >= since
+                      and p["meta"].get("status") not in ("cancelled", "skipped")]
+            item = pick_item(kind, banks, state, taken, notes, recent)
             state["rot"][slot["day"]] = start + 1
             if kind == "puzzle":
                 taken.add(placement(item["fen"]))

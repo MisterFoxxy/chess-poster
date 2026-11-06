@@ -13,7 +13,9 @@
   python publisher.py --dry-run  # показать, что было бы сделано, ничего не отправляя
   python publisher.py --list     # показать очередь
 
-Telegram: пост с картинкой уходит в канал, когда наступило время when.
+Telegram: пост с картинкой уходит в канал, когда наступило время when. Если в шапке есть
+поля poll и poll_options, сразу под постом бот публикует опрос (с poll_correct — викторину),
+см. poll_of() ниже. В ВК опрос не отправляется.
 
 ВКонтакте: ключ сообщества не умеет прикреплять картинки к записям на стене.
 Поэтому по умолчанию (VK_MODE=schedule) действует схема «текст в отложку, картинка в личку»:
@@ -110,7 +112,33 @@ def done_of(meta):
 
 # ---------- Telegram ----------
 
-def send_telegram(text, image):
+def poll_of(meta):
+    """Опрос под постом в Telegram из полей шапки:
+         poll: вопрос
+         poll_options: вариант 1 | вариант 2 | ...   (от 2 до 10)
+         poll_correct: номер правильного варианта с нуля (тогда это викторина)
+         poll_note: пояснение, которое видно после ответа в викторине
+         poll_hint: строка, которая добавляется к тексту поста в Telegram (в ВК её нет)
+    Возвращает словарь или None."""
+    question = meta.get("poll", "").strip()
+    options = [o.strip() for o in meta.get("poll_options", "").split("|") if o.strip()]
+    if not question or not 2 <= len(options) <= 10:
+        return None
+    poll = {"question": question[:300], "options": [o[:100] for o in options]}
+    correct = meta.get("poll_correct", "").strip()
+    if correct.isdigit() and int(correct) < len(options):
+        poll["correct"] = int(correct)
+        poll["note"] = meta.get("poll_note", "").strip()[:200]
+    return poll
+
+
+def telegram_text(body, meta):
+    hint = meta.get("poll_hint", "").strip()
+    return f"{body}\n\n{hint}" if hint and poll_of(meta) else body
+
+
+def send_telegram(text, image, poll=None):
+    import json
     import requests
 
     token = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -122,20 +150,35 @@ def send_telegram(text, image):
         if not data.get("ok"):
             raise RuntimeError(f"Telegram: {data.get('description')}")
 
-    if image:
-        caption = text if len(text) <= TG_CAPTION_LIMIT else ""
-        with open(image, "rb") as f:
-            resp = requests.post(
-                api + "sendPhoto",
-                data={"chat_id": chat_id, "caption": caption},
-                files={"photo": f},
-                timeout=60,
-            )
+    def send_post():
+        if image:
+            caption = text if len(text) <= TG_CAPTION_LIMIT else ""
+            with open(image, "rb") as f:
+                resp = requests.post(
+                    api + "sendPhoto",
+                    data={"chat_id": chat_id, "caption": caption},
+                    files={"photo": f},
+                    timeout=60,
+                )
+            check(resp)
+            if caption:
+                return
+        resp = requests.post(api + "sendMessage", data={"chat_id": chat_id, "text": text}, timeout=30)
         check(resp)
-        if caption:
-            return
-    resp = requests.post(api + "sendMessage", data={"chat_id": chat_id, "text": text}, timeout=30)
-    check(resp)
+
+    send_post()
+    if not poll:
+        return
+    data = {"chat_id": chat_id, "question": poll["question"], "is_anonymous": "true",
+            "options": json.dumps([{"text": o} for o in poll["options"]], ensure_ascii=False)}
+    if "correct" in poll:
+        data.update({"type": "quiz", "correct_option_id": poll["correct"]})
+        if poll.get("note"):
+            data["explanation"] = poll["note"]
+    try:
+        check(requests.post(api + "sendPoll", data=data, timeout=30))
+    except Exception as exc:  # пост уже ушёл: опрос не обязателен, повторно пост не отправляем
+        print(f"Telegram: пост отправлен, но опрос не прошёл: {exc}", file=sys.stderr)
 
 
 def _owner_api():
@@ -338,7 +381,7 @@ def run(dry_run):
                     how = ("в отложенные записи на " + meta["when"]) if scheduled else "сразу"
                     how += ", картинка вам в личку"
                 else:
-                    how = "публикация"
+                    how = "публикация" + (", опрос: " + poll_of(meta)["question"] if poll_of(meta) else "")
                 print(f"[dry-run] {path.name} -> {target} ({how}): {len(body)} симв., картинка: {image or 'нет'}")
                 print("    " + body[:120].replace("\n", " ") + ("..." if len(body) > 120 else ""))
                 continue
@@ -349,8 +392,9 @@ def run(dry_run):
             updates = {}
             try:
                 if target == "telegram":
-                    send_telegram(body, image_path)
-                    note = "отправлено в telegram"
+                    poll = poll_of(meta)
+                    send_telegram(telegram_text(body, meta), image_path, poll)
+                    note = "отправлено в telegram" + (" (с опросом)" if poll else "")
                 elif vk_mode() == "manual":
                     send_vk_manual(body, image_path, when, due)
                     note = "ВК: весь пост отправлен вам в личку Telegram"
